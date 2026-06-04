@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>A2-Lite to WAV (bulk)</title>
+<style>
+  body{background:#e8e2d0; color:#222; font-family:Arial, Helvetica, sans-serif; font-size:14px;
+    margin:0; padding:40px; display:flex; justify-content:center}
+  .box{background:#f0ece0; border:1px solid #b3ac95; padding:24px; width:100%; max-width:560px}
+  h1{font-size:16px; font-weight:bold; margin:0 0 4px}
+  .sub{color:#6b6450; margin:0 0 20px}
+  input[type=file]{display:block; margin:0 0 16px; font-size:13px}
+  button{font-family:inherit; font-size:13px; padding:7px 14px; border:1px solid #8a8470;
+    background:#ddd6c2; color:#222; cursor:pointer}
+  button:disabled{color:#999; border-color:#c0bba6; background:#e6e1d2; cursor:not-allowed}
+  button.row{padding:3px 10px; font-size:12px}
+  #list{margin:14px 0 0; border-top:1px solid #d2cbb4}
+  .item{display:flex; align-items:center; gap:10px; padding:9px 0; border-bottom:1px solid #d2cbb4}
+  .item .n{flex:none; width:18px; color:#6b6450}
+  .item .name{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  .item .info{flex:none; color:#6b6450}
+  .item.bad .info{color:#a32020}
+  .item .out{color:#444}
+  #note{margin-top:16px; min-height:18px; color:#6b6450}
+  #note.bad{color:#a32020}
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>A2-Lite to WAV — bulk</h1>
+  <p class="sub">Up to 10 A2 .nam files. Outputs nam_weights1.wav, nam_weights2.wav, … in order.</p>
+
+  <input type="file" id="file" accept=".nam,application/json" multiple>
+  <button id="zip" disabled>Download all (.zip)</button>
+
+  <div id="list"></div>
+  <div id="note">No files loaded.</div>
+</div>
+
+<script>
+const KS=[6,6,6,6,6,6,6,6,6,6,6,6,6,6,15,15,6,6,6,6,6,6,6], EXPECTED=1871, MAX=10;
+let results=[];
+const $=id=>document.getElementById(id);
+function note(ok,msg){ const n=$("note"); n.textContent=msg; n.className=ok?"":"bad"; }
+
+function sliceTo3(w8){
+  let p=0; const out=[]; const take=()=>w8[p++];
+  const conv1d=(inF,outF,inS,outS,K)=>{
+    for(let i=0;i<outF;i++)for(let j=0;j<inF;j++)for(let k=0;k<K;k++){const v=take();if(i<outS&&j<inS)out.push(v);}
+    for(let i=0;i<outF;i++){const v=take();if(i<outS)out.push(v);}};
+  const conv1x1=(inF,outF,inS,outS,b)=>{
+    for(let i=0;i<outF;i++)for(let j=0;j<inF;j++){const v=take();if(i<outS&&j<inS)out.push(v);}
+    if(b)for(let i=0;i<outF;i++){const v=take();if(i<outS)out.push(v);}};
+  conv1x1(1,8,1,3,false);
+  for(const K of KS){conv1d(8,8,3,3,K);conv1x1(1,8,1,3,false);conv1x1(8,8,3,3,true);}
+  for(let j=0;j<8;j++)for(let k=0;k<16;k++){const v=take();if(j<3)out.push(v);}
+  out.push(take());out.push(take()); return out;
+}
+
+function extract(doc){
+  const arch=doc.architecture, sr=doc.sample_rate||48000;
+  if(arch==="SlimmableContainer"){
+    for(const sm of (doc.config && doc.config.submodels || [])){
+      const m=sm.model, ch=m && m.config && m.config.layers && m.config.layers[0].channels;
+      if(ch===3) return {weights:m.weights, sr:m.sample_rate||sr};
+    }
+    throw new Error("no 3-channel submodel");
+  }
+  if(arch==="WaveNet"){
+    const ch=doc.config.layers[0].channels;
+    if(ch===3) return {weights:doc.weights, sr};
+    if(ch===8){ if(!doc.config.layers[0].slimmable) throw new Error("8-ch not slimmable");
+      return {weights:sliceTo3(doc.weights), sr}; }
+    throw new Error("unexpected channels: "+ch);
+  }
+  throw new Error("not an A2 model ("+arch+")");
+}
+
+function readText(file){ return new Promise((res,rej)=>{
+  const fr=new FileReader(); fr.onload=()=>res(fr.result); fr.onerror=()=>rej(new Error("read failed")); fr.readAsText(file);
+});}
+
+function buildWavBytes(s,sr){
+  const n=s.length, buf=new ArrayBuffer(44+n*4), dv=new DataView(buf);
+  const ws=(o,t)=>{for(let i=0;i<t.length;i++)dv.setUint8(o+i,t.charCodeAt(i));};
+  ws(0,"RIFF");dv.setUint32(4,36+n*4,true);ws(8,"WAVE");ws(12,"fmt ");
+  dv.setUint32(16,16,true);dv.setUint16(20,3,true);dv.setUint16(22,1,true);
+  dv.setUint32(24,sr,true);dv.setUint32(28,sr*4,true);dv.setUint16(32,4,true);dv.setUint16(34,32,true);
+  ws(36,"data");dv.setUint32(40,n*4,true);
+  for(let i=0;i<n;i++)dv.setFloat32(44+i*4,s[i],true);
+  return new Uint8Array(buf);
+}
+
+function dl(name,bytes){
+  const url=URL.createObjectURL(new Blob([bytes],{type:"application/octet-stream"}));
+  const a=document.createElement("a"); a.href=url; a.download=name; a.click(); URL.revokeObjectURL(url);
+}
+
+// minimal store-only ZIP
+function crc32(b){ let crc=0^(-1);
+  for(let i=0;i<b.length;i++){ let c=(crc^b[i])&0xff;
+    for(let k=0;k<8;k++) c = (c&1)?((c>>>1)^0xEDB88320):(c>>>1);
+    crc=(crc>>>8)^c; }
+  return (crc^(-1))>>>0;
+}
+function makeZip(files){
+  const enc=new TextEncoder(), local=[], central=[]; let off=0;
+  for(const f of files){
+    const nb=enc.encode(f.name), data=f.bytes, crc=crc32(data), size=data.length, start=off;
+    const lh=new Uint8Array(30), ld=new DataView(lh.buffer);
+    ld.setUint32(0,0x04034b50,true); ld.setUint16(4,20,true); ld.setUint16(6,0,true); ld.setUint16(8,0,true);
+    ld.setUint16(10,0,true); ld.setUint16(12,0,true); ld.setUint32(14,crc,true);
+    ld.setUint32(18,size,true); ld.setUint32(22,size,true); ld.setUint16(26,nb.length,true); ld.setUint16(28,0,true);
+    local.push(lh,nb,data); off+=30+nb.length+size;
+    const ch=new Uint8Array(46), cd=new DataView(ch.buffer);
+    cd.setUint32(0,0x02014b50,true); cd.setUint16(4,20,true); cd.setUint16(6,20,true); cd.setUint16(8,0,true);
+    cd.setUint16(10,0,true); cd.setUint16(12,0,true); cd.setUint16(14,0,true); cd.setUint32(16,crc,true);
+    cd.setUint32(20,size,true); cd.setUint32(24,size,true); cd.setUint16(28,nb.length,true);
+    cd.setUint16(30,0,true); cd.setUint16(32,0,true); cd.setUint16(34,0,true); cd.setUint16(36,0,true);
+    cd.setUint32(38,0,true); cd.setUint32(42,start,true);
+    central.push(ch,nb);
+  }
+  const cdStart=off; let cdSize=0; for(const c of central) cdSize+=c.length;
+  const eo=new Uint8Array(22), ed=new DataView(eo.buffer);
+  ed.setUint32(0,0x06054b50,true); ed.setUint16(8,files.length,true); ed.setUint16(10,files.length,true);
+  ed.setUint32(12,cdSize,true); ed.setUint32(16,cdStart,true);
+  return new Blob([...local,...central,eo],{type:"application/zip"});
+}
+
+function render(){
+  const list=$("list"); list.innerHTML="";
+  results.forEach((r,i)=>{
+    const div=document.createElement("div"); div.className="item"+(r.ok?"":" bad");
+    div.innerHTML='<span class="n">'+(i+1)+'.</span>'+
+      '<span class="name" title="'+r.src+'">'+r.src+'</span>'+
+      '<span class="info">'+(r.ok?('&rarr; <span class="out">'+r.out+'</span> &middot; '+r.n+' wt'):r.msg)+'</span>';
+    if(r.ok){ const b=document.createElement("button"); b.className="row"; b.textContent="Download";
+      b.onclick=()=>dl(r.out,r.bytes); div.appendChild(b); }
+    list.appendChild(div);
+  });
+  $("zip").disabled = !results.some(r=>r.ok);
+}
+
+async function handle(files){
+  files=Array.from(files);
+  let over=false; if(files.length>MAX){ files=files.slice(0,MAX); over=true; }
+  results=[];
+  for(let i=0;i<files.length;i++){
+    const f=files[i], out="nam_weights"+(i+1)+".wav";
+    try{
+      const res=extract(JSON.parse(await readText(f)));
+      const w=(res.weights||[]).map(Number);
+      if(w.length!==EXPECTED) throw new Error("got "+w.length+", need "+EXPECTED);
+      if(!w.every(Number.isFinite)) throw new Error("NaN/Inf");
+      results.push({src:f.name, out, ok:true, n:w.length, bytes:buildWavBytes(w,Math.round(res.sr))});
+    }catch(e){ results.push({src:f.name, out, ok:false, msg:"Error: "+e.message}); }
+  }
+  render();
+  const good=results.filter(r=>r.ok).length;
+  note(good>0, good+" of "+results.length+" ready"+(over?" (limited to first "+MAX+")":"")+".");
+}
+
+$("file").onchange=e=>{ if(e.target.files.length) handle(e.target.files); };
+$("zip").onclick=()=>{
+  const ok=results.filter(r=>r.ok).map(r=>({name:r.out, bytes:r.bytes}));
+  if(!ok.length) return;
+  const url=URL.createObjectURL(makeZip(ok));
+  const a=document.createElement("a"); a.href=url; a.download="nam_weights.zip"; a.click(); URL.revokeObjectURL(url);
+};
+</script>
+</body>
+</html>
